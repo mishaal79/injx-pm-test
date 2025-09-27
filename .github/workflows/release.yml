@@ -1,0 +1,327 @@
+name: Release
+
+'on':
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: 'Release target environment'
+        required: true
+        default: 'testpypi'
+        type: choice
+        options:
+          - testpypi
+          - pypi  # Changed from 'release' to 'pypi' for clarity
+      dry_run:
+        description: 'Dry run (test without releasing)'
+        required: false
+        default: false
+        type: boolean
+
+# Prevent simultaneous releases
+concurrency:
+  group: release-${{ github.repository }}-${{ inputs.target_environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: ${{ inputs.target_environment == 'testpypi' && 'Test Release (TestPyPI)' || 'Production Release (PyPI)' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ inputs.target_environment }}
+    permissions:
+      id-token: write      # OIDC for PyPI/TestPyPI publishing
+      contents: write      # Git operations, tag creation, releases
+      pull-requests: write  # PR creation back to main
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      released: ${{ steps.publish.outputs.released }}
+      pr_url: ${{ steps.pr.outputs.url }}
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@e2f20e631ae6d7dd3b768f56a5d2af784dd54791  # v4.1.0
+        with:
+          fetch-depth: 0  # Required for semantic-release
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c  # v6.0.0
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4  # v6.7.0
+        with:
+          version: "0.8.19"
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+          prune-cache: false
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Verify upstream state
+        run: |
+          echo "Verifying branch is up-to-date with origin/main..."
+          git fetch origin main
+          LOCAL_SHA=$(git rev-parse HEAD)
+          REMOTE_SHA=$(git rev-parse origin/main)
+          if [[ "$LOCAL_SHA" != "$REMOTE_SHA" ]]; then
+            echo "::error::Local main branch is not up-to-date with origin/main"
+            echo "Local SHA: $LOCAL_SHA"
+            echo "Remote SHA: $REMOTE_SHA"
+            exit 1
+          fi
+          echo "✅ Branch is up-to-date with origin/main"
+
+      - name: Calculate next version
+        id: version
+        run: |
+          # Get current version
+          CURRENT_VERSION=$(uv run python -c \
+            "import tomllib; import pathlib; \
+            print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "Current version: $CURRENT_VERSION"
+
+          # Always determine version from commits (no manual overrides)
+          NEXT_VERSION=$(uv run semantic-release version --print)
+          echo "Next version: $NEXT_VERSION"
+
+          if [[ "$NEXT_VERSION" == "$CURRENT_VERSION" ]]; then
+            echo "::notice::No release needed - no changes since v$CURRENT_VERSION"
+            echo "needs_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Release needed: v$CURRENT_VERSION → v$NEXT_VERSION"
+            {
+              echo "needs_release=true"
+              echo "current=$CURRENT_VERSION"
+              echo "version=$NEXT_VERSION"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release branch
+        if: steps.version.outputs.needs_release == 'true' && inputs.dry_run == false
+        id: branch
+        run: |
+          # Create branch with clear naming for distribution channel
+          BRANCH="release/${{ inputs.target_environment }}-v${{ steps.version.outputs.version }}"
+          echo "Creating branch: $BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+          # Update version and changelog on main branch first (semantic-release only works on main)
+          echo "Running semantic-release on main branch to update version and changelog..."
+          uv run semantic-release -v version --no-push --no-vcs-release --no-commit --no-tag
+
+          # Create and switch to release branch with the updated files (force create for idempotency)
+          git checkout -B "$BRANCH"
+
+          # Push the release branch
+          git push -u origin "$BRANCH"
+          echo "✅ Release branch created and pushed"
+
+      - name: Build packages
+        if: steps.version.outputs.needs_release == 'true' && inputs.dry_run == false
+        run: |
+          echo "Building packages for v${{ steps.version.outputs.version }}..."
+          rm -rf dist/
+          uv build
+          echo "Built packages:"
+          ls -la dist/
+
+      - name: Publish package
+        id: publish
+        if: steps.version.outputs.needs_release == 'true' && inputs.dry_run == false
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Check if version already exists on the target repository
+          if [[ "${{ inputs.target_environment }}" == "testpypi" ]]; then
+            echo "Checking if v$VERSION already exists on TestPyPI..."
+            if uv pip index --index-url https://test.pypi.org/simple/ injx 2>/dev/null | grep -q "$VERSION"; then
+              echo "::notice::Version $VERSION already exists on TestPyPI, skipping publish"
+              echo "released=skipped" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Publishing to TestPyPI..."
+            uv publish --publish-url https://test.pypi.org/legacy/ --trusted-publishing always
+            echo "✅ Published v$VERSION to TestPyPI"
+          else
+            echo "Checking if v$VERSION already exists on PyPI..."
+            if uv pip index injx 2>/dev/null | grep -q "$VERSION"; then
+              echo "::notice::Version $VERSION already exists on PyPI, skipping publish"
+              echo "released=skipped" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Publishing to PyPI..."
+            uv publish --trusted-publishing always
+            echo "✅ Published v$VERSION to PyPI"
+          fi
+          echo "released=true" >> "$GITHUB_OUTPUT"
+
+      - name: Post-release actions
+        if: steps.version.outputs.needs_release == 'true' && inputs.dry_run == false
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ inputs.target_environment }}" == "testpypi" ]]; then
+            # TestPyPI: Delete the branch after successful publish
+            echo "Cleaning up TestPyPI release branch..."
+            git checkout main
+            git push origin --delete "${{ steps.branch.outputs.branch }}"
+            echo "✅ TestPyPI release complete, branch deleted"
+            echo "No PR needed for TestPyPI releases"
+
+          else
+            # Production PyPI: Create git tag and PR to main
+            TAG="v${{ steps.version.outputs.version }}"
+            echo "Creating git tag for production release..."
+
+            # Check if tag already exists
+            if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+              git tag -a "$TAG" -m "Release $TAG"
+              git push origin "$TAG"
+              echo "✅ Created and pushed tag $TAG"
+            else
+              echo "::notice::Tag $TAG already exists, skipping tag creation"
+            fi
+
+            # Create PR to main for permanent record (check if PR already exists)
+            BRANCH_NAME="${{ steps.branch.outputs.branch }}"
+            EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --base main \
+              --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+            if [[ -n "$EXISTING_PR" ]]; then
+              echo "::notice::PR already exists for branch $BRANCH_NAME: #$EXISTING_PR"
+              PR_URL=$(gh pr view "$EXISTING_PR" --json url --jq '.url')
+            else
+              PR_URL=$(gh pr create \
+                --title "🚀 Release v${{ steps.version.outputs.version }} to PyPI" \
+                --body "## Production Release v${{ steps.version.outputs.version }}
+
+          This release has been successfully published to PyPI.
+
+          ### Changes
+          - Version bumped to v${{ steps.version.outputs.version }}
+          - CHANGELOG.md updated with release notes
+          - Git tag created: \`v${{ steps.version.outputs.version }}\`
+
+          ### Package Links
+          - 📦 [PyPI](https://pypi.org/project/injx/${{ steps.version.outputs.version }}/)
+          - 🏷️ [Git Tag](https://github.com/${{ github.repository }}/releases/tag/v${{ steps.version.outputs.version }})
+
+          ### Verification
+          \`\`\`bash
+          pip install injx==${{ steps.version.outputs.version }}
+          \`\`\`
+
+          Merging this PR will update the main branch with the release version." \
+                --base main \
+                --head "$BRANCH_NAME")
+              echo "✅ Created new PR: $PR_URL"
+            fi
+
+            echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+            echo "✅ PyPI release complete, PR created: $PR_URL"
+          fi
+
+      - name: Create GitHub Release (production only)
+        if: >-
+          steps.version.outputs.needs_release == 'true' &&
+          inputs.dry_run == false &&
+          inputs.target_environment == 'pypi'
+        uses: softprops/action-gh-release@6cbd405e2c4e67a21c47fa9e383d020e4e28b836  # v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+      - name: Dry run summary
+        if: inputs.dry_run == true
+        run: |
+          {
+            echo "## Dry Run Complete"
+            echo ""
+            if [[ "${{ steps.version.outputs.needs_release }}" == "true" ]]; then
+              echo "Would have released version: **v${{ steps.version.outputs.version }}**"
+              echo "Target: **${{ inputs.target_environment == 'testpypi' && 'TestPyPI' || 'PyPI' }}**"
+              echo ""
+              echo "### Planned Actions:"
+              BRANCH_NAME="release/${{ inputs.target_environment }}-v${{ steps.version.outputs.version }}"
+              echo "1. Create branch: \`$BRANCH_NAME\`"
+              echo "2. Update version in pyproject.toml"
+              echo "3. Update CHANGELOG.md"
+              echo "4. Build and publish packages"
+              if [[ "${{ inputs.target_environment }}" == "testpypi" ]]; then
+                echo "5. Delete branch after publish (no PR)"
+              else
+                echo "5. Create git tag: \`v${{ steps.version.outputs.version }}\`"
+                echo "6. Create PR to main"
+                echo "7. Create GitHub release"
+              fi
+            else
+              echo "No release needed - no changes since last release."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Release summary
+        if: inputs.dry_run == false
+        run: |
+          if [[ "${{ steps.version.outputs.needs_release }}" == "false" ]]; then
+            {
+              echo "## No Release Needed"
+              echo "No changes detected since last release."
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${{ steps.publish.outputs.released }}" == "true" ]]; then
+            {
+              echo "## 🎉 Release Complete"
+              echo ""
+              echo "**Version**: v${{ steps.version.outputs.version }}"
+              echo "**Target**: ${{ inputs.target_environment == 'testpypi' && 'TestPyPI' || 'PyPI' }}"
+              echo ""
+
+              if [[ "${{ inputs.target_environment }}" == "testpypi" ]]; then
+                echo "### TestPyPI Release"
+                echo "- ✅ Published to TestPyPI"
+                echo "- ✅ Branch cleaned up (no git pollution)"
+                echo ""
+                echo "**Test the release:**"
+                echo "\`\`\`bash"
+                echo "pip install -i https://test.pypi.org/simple/ injx==${{ steps.version.outputs.version }}"
+                echo "\`\`\`"
+                echo ""
+                echo "**Next step:** If tests pass, create production release with \`target_environment: pypi\`"
+              else
+                echo "### Production Release"
+                echo "- ✅ Published to PyPI"
+                echo "- ✅ Git tag created"
+                echo "- ✅ GitHub release created"
+                echo "- ✅ PR created for main branch update"
+                echo ""
+                echo "**PR**: ${{ steps.pr.outputs.url }}"
+                echo ""
+                echo "**Install:**"
+                echo "\`\`\`bash"
+                echo "pip install injx==${{ steps.version.outputs.version }}"
+                echo "\`\`\`"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## Release Failed"
+              echo "Check the workflow logs for details."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
